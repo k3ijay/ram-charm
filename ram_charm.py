@@ -22,8 +22,47 @@ from typing import Dict, List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
-# 1. 不足ライブラリの自動インストール
+# 1. 不足ライブラリの自動インストール & Tcl/Tk パス補正
 # ---------------------------------------------------------------------------
+def _fix_tcl_tk_env() -> None:
+    """macOS / uv 等の環境で TCL_LIBRARY / TK_LIBRARY が未設定の場合に自動補完する。"""
+    if "TCL_LIBRARY" in os.environ and "TK_LIBRARY" in os.environ:
+        return
+
+    search_roots = [
+        os.path.join(sys.base_prefix, "lib"),
+        os.path.join(sys.prefix, "lib"),
+        os.path.expanduser("~/.local/share/uv/python"),
+        "/opt/homebrew/opt/tcl-tk/lib",
+        "/usr/local/opt/tcl-tk/lib",
+    ]
+    for root_dir in search_roots:
+        if not os.path.isdir(root_dir):
+            continue
+        try:
+            for dirpath, dirnames, _ in os.walk(root_dir):
+                # 深すぎる走査を防止
+                rel_depth = dirpath[len(root_dir):].count(os.sep)
+                if rel_depth >= 4:
+                    dirnames.clear()
+                    continue
+                for d in dirnames:
+                    full_p = os.path.join(dirpath, d)
+                    if "TCL_LIBRARY" not in os.environ and d.startswith("tcl8."):
+                        if os.path.exists(os.path.join(full_p, "init.tcl")):
+                            os.environ["TCL_LIBRARY"] = full_p
+                    if "TK_LIBRARY" not in os.environ and d.startswith("tk8."):
+                        if os.path.exists(os.path.join(full_p, "tk.tcl")):
+                            os.environ["TK_LIBRARY"] = full_p
+                if "TCL_LIBRARY" in os.environ and "TK_LIBRARY" in os.environ:
+                    return
+        except Exception:
+            pass
+
+
+_fix_tcl_tk_env()
+
+
 def ensure_dependencies() -> None:
     """Pillow と psutil が未導入なら自動でインストールする。"""
     required = [
@@ -833,12 +872,20 @@ class MemoryMonitor:
 
     def stop(self) -> None:
         self._stop_event.set()
+        if self._thread.is_alive() and threading.current_thread() != self._thread:
+            try:
+                self._thread.join(timeout=0.5)
+            except Exception:
+                pass
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
-            snap = self._read_now()
-            with self._lock:
-                self._snapshot = snap
+            try:
+                snap = self._read_now()
+                with self._lock:
+                    self._snapshot = snap
+            except Exception:
+                break
             self._stop_event.wait(self._interval)
 
     def set_override(self, percent: Optional[float]) -> None:
@@ -981,6 +1028,7 @@ class RAMCharmApp:
         self.drag_win_start_x = 0.0
         self.drag_win_start_y = 0.0
         self._pending_click_after: Optional[str] = None
+        self._tick_after_id: Optional[str] = None
 
         # Canvas 上のアイテム作成
         self.cat_center_x = self.WIN_W // 2
@@ -1076,7 +1124,10 @@ class RAMCharmApp:
             label="タスクバーの上に戻る", command=self._snap_to_taskbar
         )
         self.menu.add_separator()
-        self.menu.add_command(label="終了", command=self.quit_app)
+        # メニューのポップアップループを安全に抜けた直後に終了処理を走らせる
+        self.menu.add_command(
+            label="終了", command=lambda: self.root.after_idle(self.quit_app)
+        )
 
     def set_test_mode(self, percent: Optional[float]) -> None:
         """モード切替テスト（None=自動、35/65/85=擬似再現）。"""
@@ -1093,8 +1144,14 @@ class RAMCharmApp:
     def _on_right_click(self, event: tk.Event) -> None:
         try:
             self.menu.tk_popup(event.x_root, event.y_root)
+        except Exception:
+            pass
         finally:
-            self.menu.grab_release()
+            try:
+                if self.menu.winfo_exists():
+                    self.menu.grab_release()
+            except Exception:
+                pass
 
     def _show_memory_info_dialog(self) -> None:
         eff_pct, snap, is_test = self.monitor.get_state()
@@ -1356,6 +1413,11 @@ class RAMCharmApp:
     def _tick(self) -> None:
         if not self._running:
             return
+        try:
+            if not self.root.winfo_exists():
+                return
+        except Exception:
+            return
 
         now = time.monotonic()
         self.tick_count += 1
@@ -1502,14 +1564,50 @@ class RAMCharmApp:
                 )
 
         # 約 30fps (33ms) で次フレームを予約
-        self.root.after(33, self._tick)
+        try:
+            if self._running and self.root.winfo_exists():
+                self._tick_after_id = self.root.after(33, self._tick)
+        except Exception:
+            self._tick_after_id = None
 
     def run(self) -> None:
-        self.root.mainloop()
+        try:
+            self.root.mainloop()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.quit_app()
 
     def quit_app(self) -> None:
+        if not self._running:
+            return
         self._running = False
-        self.monitor.stop()
+
+        # 予約済みタイマーを安全に解除
+        if self._tick_after_id is not None:
+            try:
+                self.root.after_cancel(self._tick_after_id)
+            except Exception:
+                pass
+            self._tick_after_id = None
+
+        if self._pending_click_after is not None:
+            try:
+                self.root.after_cancel(self._pending_click_after)
+            except Exception:
+                pass
+            self._pending_click_after = None
+
+        # メモリ監視スレッド停止
+        if hasattr(self, "monitor") and self.monitor is not None:
+            self.monitor.stop()
+
+        # イベントループ停止とウィンドウ破棄
+        try:
+            self.root.quit()
+        except Exception:
+            pass
+
         try:
             self.root.destroy()
         except Exception:
@@ -1557,7 +1655,26 @@ def main() -> None:
 
     enable_windows_dpi_awareness()
     app = RAMCharmApp(initial_test_percent=initial_test)
-    app.run()
+
+    # SIGINT (Ctrl+C) / SIGTERM で確実にクリーン終了
+    try:
+        import signal
+
+        def _sig_handler(_sig: int, _frame: object) -> None:
+            app.quit_app()
+
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+    except Exception:
+        pass
+
+    try:
+        app.run()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    except Exception:
+        app.quit_app()
+        raise
 
 
 # 後方互換性・別名用エイリアス
